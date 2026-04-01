@@ -19,6 +19,8 @@ services:
       AUTO_LIKES_WORKERS: "2"
       AUTO_LIKES_RETRY_MAX: "3"
       AUTO_LIKES_RETRY_BACKOFF_SEC: "30"
+      LIKES_GRAPHQL_QUERY_ID: "RozQdCp4CilQzrcuU0NY5w"
+      USER_GRAPHQL_QUERY_ID: "xmU6X_CKVnQ5lSrCbAmJsg"
     volumes:
       - ./data/downloads:/data/downloads
       - ./data/logs:/data/logs

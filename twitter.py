@@ -1,5 +1,6 @@
 import asyncio
 import glob
+import json
 import logging
 import logging.handlers
 import os
@@ -9,9 +10,10 @@ import sqlite3
 import sys
 import threading
 import time
+import urllib.parse
 from datetime import datetime, timezone
 
-import httpx
+from curl_cffi import requests as cffi_requests
 import yt_dlp
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
@@ -70,6 +72,8 @@ def load_config() -> dict:
         "AUTO_LIKES_RETRY_MAX": max(_env_int("AUTO_LIKES_RETRY_MAX", 3), 0),
         "AUTO_LIKES_RETRY_BACKOFF_SEC": max(_env_int("AUTO_LIKES_RETRY_BACKOFF_SEC", 30), 1),
         "SQLITE_PATH": _env("SQLITE_PATH", "/data/state/bot.db"),
+        "LIKES_GRAPHQL_QUERY_ID": _env("LIKES_GRAPHQL_QUERY_ID", "RozQdCp4CilQzrcuU0NY5w"),
+        "USER_GRAPHQL_QUERY_ID": _env("USER_GRAPHQL_QUERY_ID", "xmU6X_CKVnQ5lSrCbAmJsg"),
     }
 
 
@@ -405,8 +409,38 @@ async def download_tweet_url(url: str, source: str, status_msg=None) -> tuple[bo
     return True, "ok"
 
 
-def _netscape_cookie_header(cookie_path: str) -> str:
-    pairs: list[str] = []
+X_BEARER_TOKEN = "AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA"
+GRAPHQL_FEATURES = {
+    "rweb_tipjar_consumption_enabled": True,
+    "responsive_web_graphql_exclude_directive_enabled": True,
+    "verified_phone_label_enabled": False,
+    "creator_subscriptions_tweet_preview_api_enabled": True,
+    "responsive_web_graphql_timeline_navigation_enabled": True,
+    "responsive_web_graphql_skip_user_profile_image_extensions_enabled": False,
+    "communities_web_enable_tweet_community_results_fetch": True,
+    "c9s_tweet_anatomy_moderator_badge_enabled": True,
+    "articles_preview_enabled": True,
+    "responsive_web_edit_tweet_api_enabled": True,
+    "graphql_is_translatable_rweb_tweet_is_translatable_enabled": True,
+    "view_counts_everywhere_api_enabled": True,
+    "longform_notetweets_consumption_enabled": True,
+    "responsive_web_twitter_article_tweet_consumption_enabled": True,
+    "tweet_awards_web_tipping_enabled": False,
+    "creator_subscriptions_quote_tweet_preview_enabled": False,
+    "freedom_of_speech_not_reach_fetch_enabled": True,
+    "standardized_nudges_misinfo": True,
+    "tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled": True,
+    "rweb_video_timestamps_enabled": True,
+    "longform_notetweets_rich_text_read_enabled": True,
+    "longform_notetweets_inline_media_enabled": True,
+    "responsive_web_enhance_cards_enabled": False,
+}
+
+_cached_user_id: dict[str, str] = {}
+
+
+def _parse_cookies_from_netscape(cookie_path: str) -> dict[str, str]:
+    cookies: dict[str, str] = {}
     try:
         with open(cookie_path, encoding="utf-8", errors="ignore") as f:
             for line in f:
@@ -416,67 +450,186 @@ def _netscape_cookie_header(cookie_path: str) -> str:
                 parts = line.split("\t")
                 if len(parts) < 7:
                     continue
-                domain, _flag, _path, _secure, _expiry, name, value = parts[:7]
-                d = domain.lower().lstrip(".")
-                if d in ("twitter.com", "x.com") or d.endswith(".twitter.com") or d.endswith(".x.com"):
-                    pairs.append(f"{name}={value}")
+                domain = parts[0].lower().lstrip(".")
+                name, value = parts[5], parts[6]
+                if domain in ("twitter.com", "x.com") or domain.endswith(".twitter.com") or domain.endswith(".x.com"):
+                    cookies[name] = value
     except OSError:
-        return ""
-    return "; ".join(pairs)
+        pass
+    return cookies
+
+
+def _build_graphql_session(cookies: dict[str, str]) -> cffi_requests.Session:
+    ct0 = cookies.get("ct0", "")
+    sess = cffi_requests.Session(impersonate="chrome")
+    sess.headers.update({
+        "authorization": f"Bearer {urllib.parse.unquote(X_BEARER_TOKEN)}",
+        "x-csrf-token": ct0,
+        "x-twitter-auth-type": "OAuth2Session",
+        "x-twitter-active-user": "yes",
+        "x-twitter-client-language": "en",
+        "content-type": "application/json",
+    })
+    for name, value in cookies.items():
+        sess.cookies.set(name, value, domain=".x.com")
+    if CONFIG["HTTP_PROXY"]:
+        sess.proxies = {"https": CONFIG["HTTP_PROXY"], "http": CONFIG["HTTP_PROXY"]}
+    return sess
+
+
+def _resolve_user_id(sess: cffi_requests.Session, screen_name: str) -> str | None:
+    if screen_name in _cached_user_id:
+        return _cached_user_id[screen_name]
+    query_id = CONFIG["USER_GRAPHQL_QUERY_ID"]
+    variables = json.dumps({"screen_name": screen_name, "withSafetyModeUserFields": True})
+    features = json.dumps({
+        "hidden_profile_subscriptions_enabled": True,
+        "rweb_tipjar_consumption_enabled": True,
+        "responsive_web_graphql_exclude_directive_enabled": True,
+        "verified_phone_label_enabled": False,
+        "highlights_tweets_tab_ui_enabled": True,
+        "responsive_web_twitter_article_notes_tab_enabled": True,
+        "subscriptions_feature_can_gift_premium": True,
+        "creator_subscriptions_tweet_preview_api_enabled": True,
+        "responsive_web_graphql_skip_user_profile_image_extensions_enabled": False,
+        "responsive_web_graphql_timeline_navigation_enabled": True,
+    })
+    url = f"https://x.com/i/api/graphql/{query_id}/UserByScreenName?variables={urllib.parse.quote(variables)}&features={urllib.parse.quote(features)}"
+    try:
+        resp = sess.get(url, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        uid = data["data"]["user"]["result"]["rest_id"]
+        _cached_user_id[screen_name] = uid
+        logger.info("已解析 @%s -> userId=%s", screen_name, uid)
+        return uid
+    except Exception as exc:
+        logger.error("解析 userId 失败 (@%s): %s", screen_name, exc)
+        return None
+
+
+def _extract_cursor_bottom(entries: list[dict]) -> str | None:
+    for entry in reversed(entries):
+        entry_id = entry.get("entryId", "")
+        if entry_id.startswith("cursor-bottom-"):
+            return entry.get("content", {}).get("value")
+    return None
+
+
+def _parse_tweet_entries(entries: list[dict]) -> list[str]:
+    urls: list[str] = []
+    for entry in entries:
+        try:
+            tweet_result = (
+                entry.get("content", {})
+                .get("itemContent", {})
+                .get("tweet_results", {})
+                .get("result", {})
+            )
+            if not tweet_result:
+                continue
+            tweet_id = tweet_result.get("rest_id")
+            if not tweet_id:
+                continue
+            screen_name = (
+                tweet_result.get("core", {})
+                .get("user_results", {})
+                .get("result", {})
+                .get("legacy", {})
+                .get("screen_name", "")
+            )
+            if screen_name:
+                urls.append(f"https://x.com/{screen_name}/status/{tweet_id}")
+            else:
+                urls.append(f"https://x.com/i/status/{tweet_id}")
+        except Exception:
+            continue
+    return urls
+
+
+def _fetch_likes_graphql(sess: cffi_requests.Session, user_id: str, count: int) -> list[str]:
+    query_id = CONFIG["LIKES_GRAPHQL_QUERY_ID"]
+    features_str = json.dumps(GRAPHQL_FEATURES)
+    all_urls: list[str] = []
+    cursor: str | None = None
+    page = 0
+    max_pages = max(count // 20, 1) + 2
+
+    while len(all_urls) < count and page < max_pages:
+        page += 1
+        variables: dict = {
+            "userId": user_id,
+            "count": min(count - len(all_urls), 100),
+            "includePromotedContent": False,
+        }
+        if cursor:
+            variables["cursor"] = cursor
+
+        url = (
+            f"https://x.com/i/api/graphql/{query_id}/Likes"
+            f"?variables={urllib.parse.quote(json.dumps(variables))}"
+            f"&features={urllib.parse.quote(features_str)}"
+        )
+        resp = sess.get(url, timeout=30)
+        if resp.status_code in (401, 403):
+            logger.error("GraphQL Likes 返回 %s: cookies 可能已过期，请重新导出。", resp.status_code)
+            break
+        if resp.status_code == 429:
+            logger.warning("GraphQL Likes 触发限流 (429)，本轮跳过。")
+            break
+        resp.raise_for_status()
+        data = resp.json()
+
+        entries: list[dict] = []
+        for instruction in (
+            data.get("data", {})
+            .get("user", {})
+            .get("result", {})
+            .get("timeline_v2", {})
+            .get("timeline", {})
+            .get("instructions", [])
+        ):
+            entries.extend(instruction.get("entries", []))
+
+        page_urls = _parse_tweet_entries(entries)
+        if not page_urls:
+            break
+        all_urls.extend(page_urls)
+        logger.info("GraphQL Likes 第 %d 页获取 %d 条 (累计 %d)", page, len(page_urls), len(all_urls))
+
+        new_cursor = _extract_cursor_bottom(entries)
+        if not new_cursor or new_cursor == cursor:
+            break
+        cursor = new_cursor
+
+    return all_urls
 
 
 def fetch_liked_urls_sync(target_user: str, max_items: int) -> list[str]:
-    """仅用 httpx 拉取点赞页 HTML，正则提取推文链接；下载仍由 yt-dlp 处理单条 status URL。"""
     if not os.path.isfile(COOKIES_PATH):
-        logger.warning("未找到 cookies 文件，无法抓取点赞页: %s", COOKIES_PATH)
+        logger.warning("未找到 cookies 文件: %s", COOKIES_PATH)
         return []
-    header = _netscape_cookie_header(COOKIES_PATH)
-    if not header:
-        logger.warning("cookies 文件中未解析到 twitter/x 域的条目: %s", COOKIES_PATH)
+    cookies = _parse_cookies_from_netscape(COOKIES_PATH)
+    if "auth_token" not in cookies or "ct0" not in cookies:
+        logger.warning("cookies 中缺少 auth_token 或 ct0，无法调用 GraphQL API。")
         return []
 
-    req_headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Cookie": header,
-    }
-    pattern = re.compile(
-        r"https://(?:twitter\.com|x\.com)/[A-Za-z0-9_]{1,30}/status/(\d+)",
-        re.IGNORECASE,
-    )
-    seen: set[str] = set()
-    out: list[str] = []
-    proxy = CONFIG["HTTP_PROXY"] or None
-
-    for page_url in (
-        f"https://twitter.com/{target_user}/likes",
-        f"https://x.com/{target_user}/likes",
-    ):
-        if len(out) >= max_items:
-            break
-        try:
-            with httpx.Client(timeout=60.0, follow_redirects=True, proxy=proxy) as client:
-                resp = client.get(page_url, headers=req_headers)
-                resp.raise_for_status()
-                text = resp.text
-        except Exception as exc:
-            logger.warning("HTTP 抓取点赞页失败 %s: %s", page_url, exc)
-            continue
-
-        for m in pattern.finditer(text):
-            tid = m.group(1)
-            if tid in seen:
-                continue
-            seen.add(tid)
-            out.append(m.group(0))
-            if len(out) >= max_items:
-                break
-
-    if not out:
-        logger.warning(
-            "点赞页未解析到任何 status 链接（页面可能为纯前端渲染）。可检查 cookies 或改用手动发链接。"
-        )
-    return out
+    sess = _build_graphql_session(cookies)
+    try:
+        user_id = _resolve_user_id(sess, target_user)
+        if not user_id:
+            return []
+        urls = _fetch_likes_graphql(sess, user_id, max_items)
+        if urls:
+            logger.info("GraphQL 获取到 %d 条点赞", len(urls))
+        else:
+            logger.warning("GraphQL 点赞列表为空（可能无新点赞或 queryId 已失效，当前: %s）。", CONFIG["LIKES_GRAPHQL_QUERY_ID"])
+        return urls[:max_items]
+    except Exception as exc:
+        logger.error("GraphQL 点赞抓取失败: %s", exc)
+        return []
+    finally:
+        sess.close()
 
 
 async def likes_poller_loop() -> None:
