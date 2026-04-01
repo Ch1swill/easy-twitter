@@ -71,6 +71,7 @@ def load_config() -> dict:
         "AUTO_LIKES_WORKERS": max(_env_int("AUTO_LIKES_WORKERS", 2), 1),
         "AUTO_LIKES_RETRY_MAX": max(_env_int("AUTO_LIKES_RETRY_MAX", 3), 0),
         "AUTO_LIKES_RETRY_BACKOFF_SEC": max(_env_int("AUTO_LIKES_RETRY_BACKOFF_SEC", 30), 1),
+        "AUTO_DISCOVER_REFRESH_HOURS": max(_env_int("AUTO_DISCOVER_REFRESH_HOURS", 24), 1),
         "SQLITE_PATH": _env("SQLITE_PATH", "/data/state/bot.db"),
         "LIKES_GRAPHQL_QUERY_ID": _env("LIKES_GRAPHQL_QUERY_ID", "RozQdCp4CilQzrcuU0NY5w"),
         "USER_GRAPHQL_QUERY_ID": _env("USER_GRAPHQL_QUERY_ID", "IGgvgiOx4QZndDHuD3x9TQ"),
@@ -281,6 +282,7 @@ class RuntimeState:
         self.auto_paused = False
         self.last_poll_at = ""
         self.last_poll_error = ""
+        self.last_discover_at: float = 0.0
 
 
 RUNTIME = RuntimeState(BotDatabase(SQLITE_PATH))
@@ -729,13 +731,29 @@ def fetch_liked_urls_sync(target_user: str, max_items: int) -> list[str]:
 
 
 async def likes_poller_loop() -> None:
+    refresh_interval = CONFIG["AUTO_DISCOVER_REFRESH_HOURS"] * 3600
+    _FAILURE_REDISCOVER_COOLDOWN = 600  # 失败触发重新发现的最小间隔（秒）
+
     while True:
         try:
             if RUNTIME.auto_paused or not CONFIG["AUTO_LIKES_ENABLED"] or not CONFIG["AUTO_LIKES_TARGET_USER"]:
                 await asyncio.sleep(5)
                 continue
+
+            if time.time() - RUNTIME.last_discover_at > refresh_interval:
+                logger.info("定时刷新 GraphQL 参数（上次: %.0f 秒前）", time.time() - RUNTIME.last_discover_at if RUNTIME.last_discover_at else 0)
+                await asyncio.get_running_loop().run_in_executor(None, _apply_auto_discover)
+                RUNTIME.last_discover_at = time.time()
+
             RUNTIME.last_poll_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             liked_urls = await asyncio.get_running_loop().run_in_executor(None, fetch_liked_urls_sync, CONFIG["AUTO_LIKES_TARGET_USER"], CONFIG["AUTO_LIKES_MAX_PER_ROUND"])
+
+            if not liked_urls and (time.time() - RUNTIME.last_discover_at > _FAILURE_REDISCOVER_COOLDOWN):
+                logger.warning("点赞列表为空，尝试重新发现 GraphQL 参数...")
+                await asyncio.get_running_loop().run_in_executor(None, _apply_auto_discover)
+                RUNTIME.last_discover_at = time.time()
+                liked_urls = await asyncio.get_running_loop().run_in_executor(None, fetch_liked_urls_sync, CONFIG["AUTO_LIKES_TARGET_USER"], CONFIG["AUTO_LIKES_MAX_PER_ROUND"])
+
             for url in liked_urls:
                 tweet_id = extract_tweet_id(url)
                 if not tweet_id:
@@ -916,6 +934,7 @@ def main() -> None:
 
     if CONFIG["AUTO_LIKES_ENABLED"]:
         _apply_auto_discover()
+        RUNTIME.last_discover_at = time.time()
 
     builder = Application.builder().token(CONFIG["BOT_TOKEN"]).post_init(on_startup).post_shutdown(on_shutdown)
     if CONFIG["HTTP_PROXY"]:
