@@ -1,0 +1,16 @@
+services:
+  easy-twitter:
+    build: .
+    container_name: easy-twitter
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DOWNLOAD_DIR: /data/downloads
+      COOKIES_FILE: /secrets/cookies.txt
+      BOT_CLEANUP_MODE: minimal
+      LOG_FILE: /data/logs/bot.log
+    volumes:
+      - ./data/downloads:/data/downloads
+      - ./data/logs:/data/logs
+      - ./secrets:/secrets:ro

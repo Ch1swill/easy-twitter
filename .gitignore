@@ -1,0 +1,18 @@
+.env
+.env.*
+!.env.example
+secrets/
+data/
+cookies.txt
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log
