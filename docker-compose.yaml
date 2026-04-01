@@ -10,7 +10,17 @@ services:
       COOKIES_FILE: /secrets/cookies.txt
       BOT_CLEANUP_MODE: minimal
       LOG_FILE: /data/logs/bot.log
+      SQLITE_PATH: /data/state/bot.db
+      AUTO_LIKES_ENABLED: "false"
+      AUTO_LIKES_TARGET_USER: ""
+      AUTO_LIKES_POLL_INTERVAL: "300"
+      AUTO_LIKES_MAX_PER_ROUND: "20"
+      AUTO_LIKES_QUEUE_MAXSIZE: "200"
+      AUTO_LIKES_WORKERS: "2"
+      AUTO_LIKES_RETRY_MAX: "3"
+      AUTO_LIKES_RETRY_BACKOFF_SEC: "30"
     volumes:
       - ./data/downloads:/data/downloads
       - ./data/logs:/data/logs
+      - ./data/state:/data/state
       - ./secrets:/secrets:ro
