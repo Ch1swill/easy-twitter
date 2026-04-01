@@ -676,19 +676,44 @@ def _fetch_likes_graphql(sess: cffi_requests.Session, user_id: str, count: int) 
         resp.raise_for_status()
         data = resp.json()
 
+        raw_text = json.dumps(data, ensure_ascii=False)
+        if page == 1:
+            logger.info("GraphQL Likes 原始响应 (前1500字符): %s", raw_text[:1500])
+            if len(raw_text) < 500:
+                logger.warning("GraphQL Likes 响应体很短 (%d 字符): %s", len(raw_text), raw_text)
+
         entries: list[dict] = []
-        for instruction in (
+        instructions = (
             data.get("data", {})
             .get("user", {})
             .get("result", {})
             .get("timeline_v2", {})
             .get("timeline", {})
             .get("instructions", [])
-        ):
+        )
+
+        if page == 1 and not instructions:
+            d = data
+            matched = []
+            for key in ("data", "user", "result", "timeline_v2", "timeline", "instructions"):
+                if isinstance(d, dict) and key in d:
+                    matched.append(key)
+                    d = d[key]
+                else:
+                    break
+            remaining = ("data", "user", "result", "timeline_v2", "timeline", "instructions")
+            stuck_at = remaining[len(matched)] if len(matched) < len(remaining) else "OK"
+            actual_keys = list(d.keys()) if isinstance(d, dict) else type(d).__name__
+            logger.warning("GraphQL Likes JSON 路径中断于 '%s' (已匹配: %s), 当前层 keys: %s",
+                           stuck_at, " -> ".join(matched) or "(root)", actual_keys)
+
+        for instruction in instructions:
             entries.extend(instruction.get("entries", []))
 
         page_urls = _parse_tweet_entries(entries)
         if not page_urls:
+            if page == 1:
+                logger.warning("GraphQL Likes 第1页无推文 (entries=%d, instructions=%d)", len(entries), len(instructions))
             break
         all_urls.extend(page_urls)
         logger.info("GraphQL Likes 第 %d 页获取 %d 条 (累计 %d)", page, len(page_urls), len(all_urls))
