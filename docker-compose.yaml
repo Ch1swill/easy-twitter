@@ -4,15 +4,27 @@ services:
     container_name: easy-twitter
     restart: unless-stopped
     environment:
+      # ===== 🔑 必填 =====
+      # Telegram Bot Token（从 @BotFather 获取）
       BOT_TOKEN: "your_telegram_bot_token_here"
-      # ALLOWED_USERS: ""
-      # HTTP_PROXY: ""
-      AUTO_LIKES_ENABLED: "false"
-      AUTO_LIKES_TARGET_USER: ""
-      AUTO_LIKES_POLL_INTERVAL: "300"
+
+      # ===== 🔧 常用选项 =====
+      # 允许使用 Bot 的 Telegram 用户 ID（逗号分隔，留空=不限制）
+      # ALLOWED_USERS: "123456,789012"
+
+      # HTTP/SOCKS5 代理（同时用于 Telegram API 和 yt-dlp）
+      # HTTP_PROXY: "socks5://127.0.0.1:1080"
+
+      # 自动点赞监控（需要 secrets/cookies.txt）
+      AUTO_LIKES_ENABLED: "false"         # 是否开启
+      AUTO_LIKES_TARGET_USER: ""          # 监控的 X 用户名（不带 @）
+      AUTO_LIKES_POLL_INTERVAL: "300"     # 轮询间隔（秒），最小 30
+
+      # 下载完成后消息处理: minimal（替换为完成提示）| delete（删除消息）
       BOT_CLEANUP_MODE: "minimal"
+
     volumes:
-      - ./data/downloads:/data/downloads
-      - ./data/logs:/data/logs
-      - ./data/state:/data/state
-      - ./secrets:/secrets
+      - ./data/downloads:/data/downloads  # 📥 下载的视频
+      - ./data/logs:/data/logs            # 📋 运行日志
+      - ./data/state:/data/state          # 🗃️ SQLite 数据库
+      - ./secrets:/secrets                # 🍪 Cookies 文件
