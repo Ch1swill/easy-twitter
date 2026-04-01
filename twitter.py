@@ -410,6 +410,85 @@ async def download_tweet_url(url: str, source: str, status_msg=None) -> tuple[bo
 
 
 X_BEARER_TOKEN = "AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA"
+
+_KNOWN_FALSE_FEATURES = frozenset({
+    "verified_phone_label_enabled",
+    "rweb_video_screen_enabled",
+    "responsive_web_profile_redirect_enabled",
+    "rweb_tipjar_consumption_enabled",
+    "premium_content_api_read_enabled",
+    "responsive_web_grok_analyze_button_fetch_trends_enabled",
+    "responsive_web_grok_analyze_post_followups_enabled",
+    "responsive_web_grok_show_grok_translated_post",
+    "responsive_web_grok_community_note_auto_translation_is_enabled",
+    "tweet_awards_web_tipping_enabled",
+    "post_ctas_fetch_enabled",
+    "longform_notetweets_inline_media_enabled",
+    "responsive_web_enhance_cards_enabled",
+    "responsive_web_graphql_skip_user_profile_image_extensions_enabled",
+})
+
+
+def _auto_discover_graphql() -> dict:
+    """从 X 前端 JS bundle 中提取 GraphQL 端点的 queryId 和 featureSwitches。"""
+    targets = {"Likes", "UserByScreenName"}
+    result: dict[str, dict] = {}
+
+    sess = cffi_requests.Session(impersonate="chrome")
+    if CONFIG["HTTP_PROXY"]:
+        sess.proxies = {"https": CONFIG["HTTP_PROXY"], "http": CONFIG["HTTP_PROXY"]}
+
+    try:
+        resp = sess.get("https://x.com", timeout=20, allow_redirects=True)
+        html = resp.text
+    except Exception as exc:
+        logger.warning("自动发现: 无法访问 x.com: %s", exc)
+        return result
+
+    js_urls = re.findall(r'src="(https://abs\.twimg\.com/responsive-web/client-web[^"]*\.js)"', html)
+    if not js_urls:
+        js_urls = re.findall(r'src="(https://abs\.twimg\.com/[^"]*\.js)"', html)
+    if not js_urls:
+        logger.warning("自动发现: HTML 中未找到 JS bundle URL")
+        return result
+
+    logger.info("自动发现: 找到 %d 个 JS bundle，开始扫描...", len(js_urls))
+
+    endpoint_pattern = re.compile(
+        r'\{queryId:"([^"]{10,40})",operationName:"([^"]+)",operationType:"\w+"'
+        r',metadata:\{featureSwitches:\[([^\]]*)\]'
+    )
+    qid_only_pattern = re.compile(
+        r'queryId:"([^"]{10,40})",operationName:"(Likes|UserByScreenName)"'
+    )
+
+    for url in js_urls:
+        if len(result) >= len(targets):
+            break
+        try:
+            js_text = sess.get(url, timeout=15).text
+        except Exception:
+            continue
+
+        for m in endpoint_pattern.finditer(js_text):
+            qid, op_name, features_raw = m.group(1), m.group(2), m.group(3)
+            if op_name in targets and op_name not in result:
+                feature_keys = [k.strip().strip('"').strip("'") for k in features_raw.split(",") if k.strip()]
+                features = {k: (k not in _KNOWN_FALSE_FEATURES) for k in feature_keys}
+                result[op_name] = {"queryId": qid, "features": features}
+                logger.info("自动发现: %s -> queryId=%s (%d features)", op_name, qid, len(features))
+
+        if len(result) < len(targets):
+            for m in qid_only_pattern.finditer(js_text):
+                qid, op_name = m.group(1), m.group(2)
+                if op_name not in result:
+                    result[op_name] = {"queryId": qid}
+                    logger.info("自动发现: %s -> queryId=%s (features 使用默认)", op_name, qid)
+
+    sess.close()
+    return result
+
+
 GRAPHQL_FEATURES = {
     "rweb_video_screen_enabled": False,
     "profile_label_improvements_pcf_label_in_post_enabled": True,
@@ -780,6 +859,29 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
             pass
 
 
+def _apply_auto_discover() -> None:
+    global GRAPHQL_FEATURES
+    try:
+        discovered = _auto_discover_graphql()
+    except Exception as exc:
+        logger.warning("自动发现 GraphQL 配置失败: %s，使用默认值", exc)
+        return
+
+    if "Likes" in discovered:
+        CONFIG["LIKES_GRAPHQL_QUERY_ID"] = discovered["Likes"]["queryId"]
+        if "features" in discovered["Likes"]:
+            GRAPHQL_FEATURES = discovered["Likes"]["features"]
+        logger.info("Likes queryId 已更新为: %s", CONFIG["LIKES_GRAPHQL_QUERY_ID"])
+    else:
+        logger.warning("自动发现未找到 Likes 端点，使用默认 queryId: %s", CONFIG["LIKES_GRAPHQL_QUERY_ID"])
+
+    if "UserByScreenName" in discovered:
+        CONFIG["USER_GRAPHQL_QUERY_ID"] = discovered["UserByScreenName"]["queryId"]
+        logger.info("UserByScreenName queryId 已更新为: %s", CONFIG["USER_GRAPHQL_QUERY_ID"])
+    else:
+        logger.warning("自动发现未找到 UserByScreenName 端点，使用默认 queryId: %s", CONFIG["USER_GRAPHQL_QUERY_ID"])
+
+
 async def on_startup(app: Application) -> None:
     if CONFIG["AUTO_LIKES_ENABLED"]:
         RUNTIME.poller_task = asyncio.create_task(likes_poller_loop(), name="likes_poller")
@@ -811,6 +913,9 @@ def main() -> None:
     print(f"Cookies: {'Found' if os.path.exists(COOKIES_PATH) else 'Not Found (Optional)'}")
     print(f"SQLite: {SQLITE_PATH}")
     print(f"Auto likes: {CONFIG['AUTO_LIKES_ENABLED']} target={CONFIG['AUTO_LIKES_TARGET_USER'] or '-'}")
+
+    if CONFIG["AUTO_LIKES_ENABLED"]:
+        _apply_auto_discover()
 
     builder = Application.builder().token(CONFIG["BOT_TOKEN"]).post_init(on_startup).post_shutdown(on_shutdown)
     if CONFIG["HTTP_PROXY"]:
