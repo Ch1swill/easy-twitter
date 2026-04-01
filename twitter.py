@@ -11,6 +11,7 @@ import threading
 import time
 from datetime import datetime, timezone
 
+import httpx
 import yt_dlp
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
@@ -355,7 +356,7 @@ def build_ydl_opts(progress_hook) -> dict:
     }
     if CONFIG["HTTP_PROXY"]:
         opts["proxy"] = CONFIG["HTTP_PROXY"]
-    if os.path.exists(COOKIES_PATH):
+    if os.path.isfile(COOKIES_PATH):
         opts["cookiefile"] = COOKIES_PATH
     return opts
 
@@ -404,23 +405,78 @@ async def download_tweet_url(url: str, source: str, status_msg=None) -> tuple[bo
     return True, "ok"
 
 
+def _netscape_cookie_header(cookie_path: str) -> str:
+    pairs: list[str] = []
+    try:
+        with open(cookie_path, encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split("\t")
+                if len(parts) < 7:
+                    continue
+                domain, _flag, _path, _secure, _expiry, name, value = parts[:7]
+                d = domain.lower().lstrip(".")
+                if d in ("twitter.com", "x.com") or d.endswith(".twitter.com") or d.endswith(".x.com"):
+                    pairs.append(f"{name}={value}")
+    except OSError:
+        return ""
+    return "; ".join(pairs)
+
+
 def fetch_liked_urls_sync(target_user: str, max_items: int) -> list[str]:
-    likes_url = f"https://x.com/{target_user}/likes"
-    ydl_opts = build_ydl_opts(None)
-    ydl_opts.update({"extract_flat": True, "skip_download": True})
-    urls: list[str] = []
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(likes_url, download=False)
-    for entry in (info.get("entries") or [])[:max_items]:
-        if not isinstance(entry, dict):
+    """仅用 httpx 拉取点赞页 HTML，正则提取推文链接；下载仍由 yt-dlp 处理单条 status URL。"""
+    if not os.path.isfile(COOKIES_PATH):
+        logger.warning("未找到 cookies 文件，无法抓取点赞页: %s", COOKIES_PATH)
+        return []
+    header = _netscape_cookie_header(COOKIES_PATH)
+    if not header:
+        logger.warning("cookies 文件中未解析到 twitter/x 域的条目: %s", COOKIES_PATH)
+        return []
+
+    req_headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Cookie": header,
+    }
+    pattern = re.compile(
+        r"https://(?:twitter\.com|x\.com)/[A-Za-z0-9_]{1,30}/status/(\d+)",
+        re.IGNORECASE,
+    )
+    seen: set[str] = set()
+    out: list[str] = []
+    proxy = CONFIG["HTTP_PROXY"] or None
+
+    for page_url in (
+        f"https://twitter.com/{target_user}/likes",
+        f"https://x.com/{target_user}/likes",
+    ):
+        if len(out) >= max_items:
+            break
+        try:
+            with httpx.Client(timeout=60.0, follow_redirects=True, proxy=proxy) as client:
+                resp = client.get(page_url, headers=req_headers)
+                resp.raise_for_status()
+                text = resp.text
+        except Exception as exc:
+            logger.warning("HTTP 抓取点赞页失败 %s: %s", page_url, exc)
             continue
-        entry_url = entry.get("url") or ""
-        if "/status/" in entry_url:
-            if entry_url.startswith("http"):
-                urls.append(entry_url)
-            else:
-                urls.append(f"https://x.com{entry_url}")
-    return urls
+
+        for m in pattern.finditer(text):
+            tid = m.group(1)
+            if tid in seen:
+                continue
+            seen.add(tid)
+            out.append(m.group(0))
+            if len(out) >= max_items:
+                break
+
+    if not out:
+        logger.warning(
+            "点赞页未解析到任何 status 链接（页面可能为纯前端渲染）。可检查 cookies 或改用手动发链接。"
+        )
+    return out
 
 
 async def likes_poller_loop() -> None:
