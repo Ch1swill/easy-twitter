@@ -3,24 +3,14 @@ services:
     build: .
     container_name: easy-twitter
     restart: unless-stopped
-    env_file:
-      - .env
     environment:
-      DOWNLOAD_DIR: /data/downloads
-      COOKIES_FILE: /secrets/cookies.txt
-      BOT_CLEANUP_MODE: minimal
-      LOG_FILE: /data/logs/bot.log
-      SQLITE_PATH: /data/state/bot.db
+      BOT_TOKEN: "your_telegram_bot_token_here"
+      # ALLOWED_USERS: ""
+      # HTTP_PROXY: ""
       AUTO_LIKES_ENABLED: "false"
       AUTO_LIKES_TARGET_USER: ""
       AUTO_LIKES_POLL_INTERVAL: "300"
-      AUTO_LIKES_MAX_PER_ROUND: "20"
-      AUTO_LIKES_QUEUE_MAXSIZE: "200"
-      AUTO_LIKES_WORKERS: "2"
-      AUTO_LIKES_RETRY_MAX: "3"
-      AUTO_LIKES_RETRY_BACKOFF_SEC: "30"
-      LIKES_GRAPHQL_QUERY_ID: "RozQdCp4CilQzrcuU0NY5w"
-      USER_GRAPHQL_QUERY_ID: "xmU6X_CKVnQ5lSrCbAmJsg"
+      BOT_CLEANUP_MODE: "minimal"
     volumes:
       - ./data/downloads:/data/downloads
       - ./data/logs:/data/logs
